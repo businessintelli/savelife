@@ -1,0 +1,399 @@
+# SaveLife.com Google Cloud Platform Infrastructure
+# Deployment Manager configuration for complete GCP deployment
+
+imports:
+- path: templates/network.py
+- path: templates/database.py
+- path: templates/storage.py
+- path: templates/compute.py
+- path: templates/security.py
+
+resources:
+# Project-level configuration
+- name: savelife-project-config
+  type: templates/project.py
+  properties:
+    projectId: savelife-platform
+    billingAccountId: BILLING_ACCOUNT_ID
+    apis:
+      - compute.googleapis.com
+      - container.googleapis.com
+      - cloudsql.googleapis.com
+      - storage.googleapis.com
+      - cloudresourcemanager.googleapis.com
+      - iam.googleapis.com
+      - secretmanager.googleapis.com
+      - cloudbuild.googleapis.com
+      - run.googleapis.com
+      - monitoring.googleapis.com
+      - logging.googleapis.com
+
+# VPC Network
+- name: savelife-network
+  type: templates/network.py
+  properties:
+    name: savelife-vpc
+    region: us-central1
+    subnets:
+      - name: savelife-subnet-us-central1
+        region: us-central1
+        ipCidrRange: 10.0.0.0/24
+        privateIpGoogleAccess: true
+      - name: savelife-subnet-us-east1
+        region: us-east1
+        ipCidrRange: 10.1.0.0/24
+        privateIpGoogleAccess: true
+
+# Cloud SQL Database
+- name: savelife-database
+  type: templates/database.py
+  properties:
+    name: savelife-db
+    region: us-central1
+    tier: db-f1-micro  # Change to db-n1-standard-1 for production
+    databaseVersion: POSTGRES_15
+    storageSize: 20  # GB
+    storageType: PD_SSD
+    backupEnabled: true
+    backupStartTime: "03:00"
+    maintenanceWindow:
+      day: 7  # Sunday
+      hour: 4
+    authorizedNetworks: []
+    privateNetwork: $(ref.savelife-network.selfLink)
+    databases:
+      - name: savelife
+        charset: UTF8
+    users:
+      - name: savelife
+        password: REPLACE_WITH_SECURE_PASSWORD
+
+# Cloud Storage Buckets
+- name: savelife-storage
+  type: templates/storage.py
+  properties:
+    buckets:
+      - name: savelife-static-assets
+        location: US
+        storageClass: STANDARD
+        publicAccess: true
+        cors:
+          - origin: ["*"]
+            method: ["GET", "HEAD"]
+            maxAgeSeconds: 3600
+      - name: savelife-documents
+        location: US
+        storageClass: STANDARD
+        publicAccess: false
+        encryption: true
+        lifecycle:
+          - action: Delete
+            condition:
+              age: 2555  # 7 years for medical records retention
+      - name: savelife-backups
+        location: US
+        storageClass: NEARLINE
+        publicAccess: false
+        encryption: true
+
+# Secret Manager
+- name: savelife-secrets
+  type: templates/security.py
+  properties:
+    secrets:
+      - name: database-password
+        value: REPLACE_WITH_SECURE_PASSWORD
+      - name: openai-api-key
+        value: REPLACE_WITH_OPENAI_KEY
+      - name: stripe-secret-key
+        value: REPLACE_WITH_STRIPE_KEY
+      - name: jwt-secret
+        value: REPLACE_WITH_JWT_SECRET
+
+# Cloud Run Services
+- name: savelife-frontend
+  type: gcp-types/run-v1:namespaces.services
+  properties:
+    parent: namespaces/savelife-platform
+    apiVersion: serving.knative.dev/v1
+    kind: Service
+    metadata:
+      name: savelife-frontend
+      namespace: savelife-platform
+      annotations:
+        run.googleapis.com/ingress: all
+        run.googleapis.com/ingress-status: all
+    spec:
+      template:
+        metadata:
+          annotations:
+            autoscaling.knative.dev/maxScale: "10"
+            autoscaling.knative.dev/minScale: "1"
+            run.googleapis.com/cpu-throttling: "false"
+            run.googleapis.com/execution-environment: gen2
+        spec:
+          containerConcurrency: 80
+          timeoutSeconds: 300
+          containers:
+          - image: gcr.io/savelife-platform/frontend:latest
+            ports:
+            - name: http1
+              containerPort: 3000
+            env:
+            - name: REACT_APP_API_URL
+              value: https://api.savelife.com
+            - name: REACT_APP_ENVIRONMENT
+              value: production
+            resources:
+              limits:
+                cpu: 1000m
+                memory: 512Mi
+              requests:
+                cpu: 100m
+                memory: 128Mi
+
+- name: savelife-backend
+  type: gcp-types/run-v1:namespaces.services
+  properties:
+    parent: namespaces/savelife-platform
+    apiVersion: serving.knative.dev/v1
+    kind: Service
+    metadata:
+      name: savelife-backend
+      namespace: savelife-platform
+      annotations:
+        run.googleapis.com/ingress: all
+        run.googleapis.com/ingress-status: all
+    spec:
+      template:
+        metadata:
+          annotations:
+            autoscaling.knative.dev/maxScale: "20"
+            autoscaling.knative.dev/minScale: "2"
+            run.googleapis.com/cpu-throttling: "false"
+            run.googleapis.com/execution-environment: gen2
+            run.googleapis.com/cloudsql-instances: savelife-platform:us-central1:savelife-db
+        spec:
+          containerConcurrency: 80
+          timeoutSeconds: 300
+          containers:
+          - image: gcr.io/savelife-platform/backend:latest
+            ports:
+            - name: http1
+              containerPort: 5000
+            env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: database-url
+                  key: latest
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: openai-api-key
+                  key: latest
+            - name: STRIPE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: stripe-secret-key
+                  key: latest
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: jwt-secret
+                  key: latest
+            - name: ENVIRONMENT
+              value: production
+            - name: GCS_BUCKET_DOCUMENTS
+              value: savelife-documents
+            - name: GCS_BUCKET_STATIC
+              value: savelife-static-assets
+            resources:
+              limits:
+                cpu: 2000m
+                memory: 2Gi
+              requests:
+                cpu: 200m
+                memory: 256Mi
+
+# Load Balancer and SSL
+- name: savelife-load-balancer
+  type: compute.v1.globalForwardingRule
+  properties:
+    name: savelife-lb
+    target: $(ref.savelife-target-proxy.selfLink)
+    portRange: 443
+    IPProtocol: TCP
+
+- name: savelife-target-proxy
+  type: compute.v1.targetHttpsProxy
+  properties:
+    name: savelife-target-proxy
+    urlMap: $(ref.savelife-url-map.selfLink)
+    sslCertificates:
+      - $(ref.savelife-ssl-cert.selfLink)
+
+- name: savelife-ssl-cert
+  type: compute.v1.sslCertificate
+  properties:
+    name: savelife-ssl-cert
+    managed:
+      domains:
+        - savelife.com
+        - www.savelife.com
+        - api.savelife.com
+
+- name: savelife-url-map
+  type: compute.v1.urlMap
+  properties:
+    name: savelife-url-map
+    defaultService: $(ref.savelife-backend-neg.selfLink)
+    hostRules:
+      - hosts:
+          - savelife.com
+          - www.savelife.com
+        pathMatcher: frontend-matcher
+      - hosts:
+          - api.savelife.com
+        pathMatcher: backend-matcher
+    pathMatchers:
+      - name: frontend-matcher
+        defaultService: $(ref.savelife-frontend-neg.selfLink)
+        pathRules:
+          - paths:
+              - /api/*
+            service: $(ref.savelife-backend-neg.selfLink)
+      - name: backend-matcher
+        defaultService: $(ref.savelife-backend-neg.selfLink)
+
+# Network Endpoint Groups for Cloud Run
+- name: savelife-frontend-neg
+  type: compute.v1.networkEndpointGroup
+  properties:
+    name: savelife-frontend-neg
+    networkEndpointType: SERVERLESS
+    region: us-central1
+    cloudRun:
+      service: savelife-frontend
+
+- name: savelife-backend-neg
+  type: compute.v1.networkEndpointGroup
+  properties:
+    name: savelife-backend-neg
+    networkEndpointType: SERVERLESS
+    region: us-central1
+    cloudRun:
+      service: savelife-backend
+
+# Backend Services
+- name: savelife-frontend-backend-service
+  type: compute.v1.backendService
+  properties:
+    name: savelife-frontend-backend-service
+    protocol: HTTPS
+    backends:
+      - group: $(ref.savelife-frontend-neg.selfLink)
+    securityPolicy: $(ref.savelife-security-policy.selfLink)
+
+- name: savelife-backend-backend-service
+  type: compute.v1.backendService
+  properties:
+    name: savelife-backend-backend-service
+    protocol: HTTPS
+    backends:
+      - group: $(ref.savelife-backend-neg.selfLink)
+    securityPolicy: $(ref.savelife-security-policy.selfLink)
+
+# Cloud Armor Security Policy
+- name: savelife-security-policy
+  type: compute.v1.securityPolicy
+  properties:
+    name: savelife-security-policy
+    description: Security policy for SaveLife platform
+    rules:
+      - priority: 1000
+        match:
+          versionedExpr: SRC_IPS_V1
+          config:
+            srcIpRanges:
+              - "*"
+        action: allow
+        description: Allow all traffic
+      - priority: 2147483647
+        match:
+          versionedExpr: SRC_IPS_V1
+          config:
+            srcIpRanges:
+              - "*"
+        action: deny(403)
+        description: Default deny rule
+
+# Cloud CDN
+- name: savelife-cdn
+  type: compute.v1.backendBucket
+  properties:
+    name: savelife-cdn
+    bucketName: savelife-static-assets
+    enableCdn: true
+    cdnPolicy:
+      cacheKeyPolicy:
+        includeHost: true
+        includeProtocol: true
+        includeQueryString: false
+      defaultTtl: 3600
+      maxTtl: 86400
+      clientTtl: 3600
+
+# Monitoring and Alerting
+- name: savelife-monitoring
+  type: templates/monitoring.py
+  properties:
+    alertPolicies:
+      - name: high-error-rate
+        displayName: High Error Rate
+        conditions:
+          - displayName: Error rate too high
+            conditionThreshold:
+              filter: resource.type="cloud_run_revision"
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 0.05
+              duration: 300s
+        notificationChannels: []
+      - name: high-latency
+        displayName: High Latency
+        conditions:
+          - displayName: Response time too high
+            conditionThreshold:
+              filter: resource.type="cloud_run_revision"
+              comparison: COMPARISON_GREATER_THAN
+              thresholdValue: 2000
+              duration: 300s
+        notificationChannels: []
+
+# IAM Bindings
+- name: savelife-iam
+  type: templates/iam.py
+  properties:
+    bindings:
+      - role: roles/cloudsql.client
+        members:
+          - serviceAccount:savelife-backend@savelife-platform.iam.gserviceaccount.com
+      - role: roles/storage.objectAdmin
+        members:
+          - serviceAccount:savelife-backend@savelife-platform.iam.gserviceaccount.com
+      - role: roles/secretmanager.secretAccessor
+        members:
+          - serviceAccount:savelife-backend@savelife-platform.iam.gserviceaccount.com
+
+outputs:
+- name: frontend-url
+  value: https://savelife.com
+- name: backend-url
+  value: https://api.savelife.com
+- name: database-connection
+  value: $(ref.savelife-database.connectionName)
+- name: static-bucket
+  value: $(ref.savelife-storage.staticBucket)
+- name: documents-bucket
+  value: $(ref.savelife-storage.documentsBucket)
+

@@ -1,0 +1,406 @@
+name: Deploy to GCP
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+      - 'backend/**'
+      - 'infrastructure/gcp/**'
+      - '.github/workflows/deploy-gcp.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+      - 'backend/**'
+      - 'infrastructure/gcp/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - prod
+
+env:
+  PROJECT_ID: savelife-platform
+  REGION: us-central1
+  GAR_LOCATION: us-central1
+  REPOSITORY: savelife-repo
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install frontend dependencies
+        working-directory: ./frontend
+        run: |
+          npm install -g pnpm
+          pnpm install --frozen-lockfile
+
+      - name: Install backend dependencies
+        working-directory: ./backend
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run frontend tests
+        working-directory: ./frontend
+        run: |
+          pnpm run test:ci
+          pnpm run lint
+          pnpm run type-check
+
+      - name: Run backend tests
+        working-directory: ./backend
+        run: |
+          python -m pytest tests/ --cov=src --cov-report=xml --cov-report=html
+          python -m flake8 src/
+          python -m mypy src/
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: test-results
+          path: |
+            frontend/coverage/
+            backend/htmlcov/
+            backend/coverage.xml
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  build:
+    name: Build and Push Images
+    runs-on: ubuntu-latest
+    needs: [test, security-scan]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    outputs:
+      frontend-image: ${{ steps.build-frontend.outputs.image }}
+      backend-image: ${{ steps.build-backend.outputs.image }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker to use gcloud as a credential helper
+        run: |
+          gcloud auth configure-docker $GAR_LOCATION-docker.pkg.dev
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push frontend image
+        id: build-frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          push: true
+          tags: |
+            ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/frontend:latest
+            ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/frontend:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+      - name: Build and push backend image
+        id: build-backend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          push: true
+          tags: |
+            ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/backend:latest
+            ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/backend:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+      - name: Scan images for vulnerabilities
+        run: |
+          # Install gcloud beta components for vulnerability scanning
+          gcloud components install beta
+          
+          # Scan images
+          gcloud beta container images scan \
+            ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/frontend:${{ github.sha }} \
+            --remote
+          
+          gcloud beta container images scan \
+            ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/backend:${{ github.sha }} \
+            --remote
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: staging-gcp
+      url: https://staging-savelife.run.app
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy backend to Cloud Run
+        run: |
+          gcloud run deploy savelife-backend-staging \
+            --image=${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/backend:${{ github.sha }} \
+            --platform=managed \
+            --region=${{ env.REGION }} \
+            --allow-unauthenticated \
+            --service-account=savelife-backend@${{ env.PROJECT_ID }}.iam.gserviceaccount.com \
+            --add-cloudsql-instances=${{ env.PROJECT_ID }}:${{ env.REGION }}:savelife-db-staging \
+            --set-secrets=DATABASE_URL=database-url-staging:latest,OPENAI_API_KEY=openai-api-key:latest,STRIPE_SECRET_KEY=stripe-secret-key:latest,JWT_SECRET=jwt-secret:latest \
+            --set-env-vars=ENVIRONMENT=staging,GCS_BUCKET_DOCUMENTS=savelife-documents-staging,GCS_BUCKET_STATIC=savelife-static-staging \
+            --memory=2Gi \
+            --cpu=2 \
+            --concurrency=80 \
+            --max-instances=10 \
+            --min-instances=1
+
+      - name: Get backend URL
+        id: backend-url
+        run: |
+          BACKEND_URL=$(gcloud run services describe savelife-backend-staging \
+            --platform=managed \
+            --region=${{ env.REGION }} \
+            --format="value(status.url)")
+          echo "url=$BACKEND_URL" >> $GITHUB_OUTPUT
+
+      - name: Deploy frontend to Cloud Run
+        run: |
+          gcloud run deploy savelife-frontend-staging \
+            --image=${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/frontend:${{ github.sha }} \
+            --platform=managed \
+            --region=${{ env.REGION }} \
+            --allow-unauthenticated \
+            --set-env-vars=REACT_APP_API_URL=${{ steps.backend-url.outputs.url }},REACT_APP_ENVIRONMENT=staging \
+            --memory=512Mi \
+            --cpu=1 \
+            --concurrency=80 \
+            --max-instances=5 \
+            --min-instances=1
+
+      - name: Run smoke tests
+        run: |
+          # Get frontend URL
+          FRONTEND_URL=$(gcloud run services describe savelife-frontend-staging \
+            --platform=managed \
+            --region=${{ env.REGION }} \
+            --format="value(status.url)")
+          
+          # Wait for services to be ready
+          sleep 30
+          
+          # Test frontend
+          curl -f $FRONTEND_URL/ || exit 1
+          
+          # Test backend health
+          curl -f ${{ steps.backend-url.outputs.url }}/api/ai/health || exit 1
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build, deploy-staging]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production-gcp
+      url: https://savelife.com
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy backend to Cloud Run
+        run: |
+          gcloud run deploy savelife-backend \
+            --image=${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/backend:${{ github.sha }} \
+            --platform=managed \
+            --region=${{ env.REGION }} \
+            --allow-unauthenticated \
+            --service-account=savelife-backend@${{ env.PROJECT_ID }}.iam.gserviceaccount.com \
+            --add-cloudsql-instances=${{ env.PROJECT_ID }}:${{ env.REGION }}:savelife-db \
+            --set-secrets=DATABASE_URL=database-url:latest,OPENAI_API_KEY=openai-api-key:latest,STRIPE_SECRET_KEY=stripe-secret-key:latest,JWT_SECRET=jwt-secret:latest \
+            --set-env-vars=ENVIRONMENT=production,GCS_BUCKET_DOCUMENTS=savelife-documents,GCS_BUCKET_STATIC=savelife-static-assets \
+            --memory=2Gi \
+            --cpu=2 \
+            --concurrency=80 \
+            --max-instances=20 \
+            --min-instances=2
+
+      - name: Get backend URL
+        id: backend-url
+        run: |
+          BACKEND_URL=$(gcloud run services describe savelife-backend \
+            --platform=managed \
+            --region=${{ env.REGION }} \
+            --format="value(status.url)")
+          echo "url=$BACKEND_URL" >> $GITHUB_OUTPUT
+
+      - name: Deploy frontend to Cloud Run
+        run: |
+          gcloud run deploy savelife-frontend \
+            --image=${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/frontend:${{ github.sha }} \
+            --platform=managed \
+            --region=${{ env.REGION }} \
+            --allow-unauthenticated \
+            --set-env-vars=REACT_APP_API_URL=${{ steps.backend-url.outputs.url }},REACT_APP_ENVIRONMENT=production \
+            --memory=512Mi \
+            --cpu=1 \
+            --concurrency=80 \
+            --max-instances=10 \
+            --min-instances=1
+
+      - name: Update load balancer
+        run: |
+          # Update URL map to point to new services
+          gcloud compute url-maps invalidate-cdn-cache savelife-url-map \
+            --path="/*" \
+            --async
+
+      - name: Run production health checks
+        run: |
+          # Get frontend URL
+          FRONTEND_URL=$(gcloud run services describe savelife-frontend \
+            --platform=managed \
+            --region=${{ env.REGION }} \
+            --format="value(status.url)")
+          
+          # Wait for services to be ready
+          sleep 60
+          
+          # Test via load balancer
+          curl -f https://savelife.com/ || exit 1
+          curl -f https://api.savelife.com/api/ai/health || exit 1
+
+      - name: Run integration tests
+        working-directory: ./frontend
+        run: |
+          npm install -g pnpm
+          pnpm install --frozen-lockfile
+          
+          # Set environment variables for tests
+          export CYPRESS_BASE_URL=https://savelife.com
+          export CYPRESS_API_URL=https://api.savelife.com
+          
+          # Run Cypress tests
+          pnpm run test:e2e:headless
+
+  performance-test:
+    name: Performance Testing
+    runs-on: ubuntu-latest
+    needs: deploy-production
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install k6
+        run: |
+          sudo apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update
+          sudo apt-get install k6
+
+      - name: Run performance tests
+        run: |
+          k6 run --vus 10 --duration 30s - <<EOF
+          import http from 'k6/http';
+          import { check, sleep } from 'k6';
+          
+          export default function () {
+            let response = http.get('https://savelife.com/');
+            check(response, {
+              'status is 200': (r) => r.status === 200,
+              'response time < 2s': (r) => r.timings.duration < 2000,
+            });
+            sleep(1);
+          }
+          EOF
+
+  notify:
+    name: Notify Deployment Status
+    runs-on: ubuntu-latest
+    needs: [deploy-production, performance-test]
+    if: always()
+    steps:
+      - name: Notify Slack
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          channel: '#deployments'
+          webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+          fields: repo,message,commit,author,action,eventName,ref,workflow
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Update deployment status
+        run: |
+          echo "GCP deployment completed successfully!"
+          echo "Frontend: https://savelife.com"
+          echo "Backend: https://api.savelife.com"
+          echo "Commit: ${{ github.sha }}"
+

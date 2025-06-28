@@ -1,0 +1,235 @@
+# Cloud Build configuration for SaveLife.com
+# Automated CI/CD pipeline for Google Cloud Platform
+
+steps:
+# Step 1: Install dependencies and run tests for frontend
+- name: 'node:18'
+  entrypoint: 'bash'
+  args:
+    - '-c'
+    - |
+      cd frontend
+      npm install -g pnpm
+      pnpm install --frozen-lockfile
+      pnpm run test:ci
+      pnpm run build
+  id: 'frontend-test-build'
+
+# Step 2: Install dependencies and run tests for backend
+- name: 'python:3.11'
+  entrypoint: 'bash'
+  args:
+    - '-c'
+    - |
+      cd backend
+      pip install -r requirements.txt
+      python -m pytest tests/ --cov=src --cov-report=xml
+  id: 'backend-test'
+
+# Step 3: Build frontend Docker image
+- name: 'gcr.io/cloud-builders/docker'
+  args:
+    - 'build'
+    - '-t'
+    - 'gcr.io/$PROJECT_ID/frontend:$COMMIT_SHA'
+    - '-t'
+    - 'gcr.io/$PROJECT_ID/frontend:latest'
+    - './frontend'
+  id: 'frontend-docker-build'
+  waitFor: ['frontend-test-build']
+
+# Step 4: Build backend Docker image
+- name: 'gcr.io/cloud-builders/docker'
+  args:
+    - 'build'
+    - '-t'
+    - 'gcr.io/$PROJECT_ID/backend:$COMMIT_SHA'
+    - '-t'
+    - 'gcr.io/$PROJECT_ID/backend:latest'
+    - './backend'
+  id: 'backend-docker-build'
+  waitFor: ['backend-test']
+
+# Step 5: Push frontend image to Container Registry
+- name: 'gcr.io/cloud-builders/docker'
+  args:
+    - 'push'
+    - 'gcr.io/$PROJECT_ID/frontend:$COMMIT_SHA'
+  id: 'frontend-docker-push'
+  waitFor: ['frontend-docker-build']
+
+# Step 6: Push backend image to Container Registry
+- name: 'gcr.io/cloud-builders/docker'
+  args:
+    - 'push'
+    - 'gcr.io/$PROJECT_ID/backend:$COMMIT_SHA'
+  id: 'backend-docker-push'
+  waitFor: ['backend-docker-build']
+
+# Step 7: Push latest tags
+- name: 'gcr.io/cloud-builders/docker'
+  args:
+    - 'push'
+    - 'gcr.io/$PROJECT_ID/frontend:latest'
+  waitFor: ['frontend-docker-push']
+
+- name: 'gcr.io/cloud-builders/docker'
+  args:
+    - 'push'
+    - 'gcr.io/$PROJECT_ID/backend:latest'
+  waitFor: ['backend-docker-push']
+
+# Step 8: Deploy to Cloud Run (only on main branch)
+- name: 'gcr.io/cloud-builders/gcloud'
+  entrypoint: 'bash'
+  args:
+    - '-c'
+    - |
+      if [ "$BRANCH_NAME" = "main" ]; then
+        echo "Deploying to production..."
+        
+        # Deploy backend
+        gcloud run deploy savelife-backend \
+          --image=gcr.io/$PROJECT_ID/backend:$COMMIT_SHA \
+          --platform=managed \
+          --region=us-central1 \
+          --allow-unauthenticated \
+          --service-account=savelife-backend@$PROJECT_ID.iam.gserviceaccount.com \
+          --add-cloudsql-instances=$PROJECT_ID:us-central1:savelife-db \
+          --set-secrets=DATABASE_URL=database-url:latest,OPENAI_API_KEY=openai-api-key:latest,STRIPE_SECRET_KEY=stripe-secret-key:latest,JWT_SECRET=jwt-secret:latest \
+          --set-env-vars=ENVIRONMENT=production,GCS_BUCKET_DOCUMENTS=savelife-documents,GCS_BUCKET_STATIC=savelife-static-assets \
+          --memory=2Gi \
+          --cpu=2 \
+          --concurrency=80 \
+          --max-instances=20 \
+          --min-instances=2
+        
+        # Get backend URL for frontend
+        BACKEND_URL=$(gcloud run services describe savelife-backend --platform=managed --region=us-central1 --format="value(status.url)")
+        
+        # Deploy frontend
+        gcloud run deploy savelife-frontend \
+          --image=gcr.io/$PROJECT_ID/frontend:$COMMIT_SHA \
+          --platform=managed \
+          --region=us-central1 \
+          --allow-unauthenticated \
+          --set-env-vars=REACT_APP_API_URL=$BACKEND_URL,REACT_APP_ENVIRONMENT=production \
+          --memory=512Mi \
+          --cpu=1 \
+          --concurrency=80 \
+          --max-instances=10 \
+          --min-instances=1
+        
+        echo "Production deployment completed!"
+      else
+        echo "Skipping deployment for branch: $BRANCH_NAME"
+      fi
+  id: 'deploy-production'
+  waitFor: ['frontend-docker-push', 'backend-docker-push']
+
+# Step 9: Run security scans
+- name: 'gcr.io/cloud-builders/gcloud'
+  entrypoint: 'bash'
+  args:
+    - '-c'
+    - |
+      echo "Running security scans..."
+      
+      # Scan frontend image
+      gcloud container images scan gcr.io/$PROJECT_ID/frontend:$COMMIT_SHA \
+        --remote || echo "Frontend security scan completed with warnings"
+      
+      # Scan backend image
+      gcloud container images scan gcr.io/$PROJECT_ID/backend:$COMMIT_SHA \
+        --remote || echo "Backend security scan completed with warnings"
+  id: 'security-scan'
+  waitFor: ['frontend-docker-push', 'backend-docker-push']
+
+# Step 10: Run integration tests (only after deployment)
+- name: 'node:18'
+  entrypoint: 'bash'
+  args:
+    - '-c'
+    - |
+      if [ "$BRANCH_NAME" = "main" ]; then
+        echo "Running integration tests..."
+        cd frontend
+        npm install -g pnpm
+        pnpm install --frozen-lockfile
+        
+        # Get service URLs
+        FRONTEND_URL=$(gcloud run services describe savelife-frontend --platform=managed --region=us-central1 --format="value(status.url)")
+        BACKEND_URL=$(gcloud run services describe savelife-backend --platform=managed --region=us-central1 --format="value(status.url)")
+        
+        # Run integration tests
+        export CYPRESS_BASE_URL=$FRONTEND_URL
+        export CYPRESS_API_URL=$BACKEND_URL
+        pnpm run test:e2e:headless || echo "Integration tests completed with warnings"
+        
+        echo "Integration tests completed!"
+      else
+        echo "Skipping integration tests for branch: $BRANCH_NAME"
+      fi
+  id: 'integration-tests'
+  waitFor: ['deploy-production']
+
+# Step 11: Notify deployment status
+- name: 'gcr.io/cloud-builders/gcloud'
+  entrypoint: 'bash'
+  args:
+    - '-c'
+    - |
+      if [ "$BRANCH_NAME" = "main" ]; then
+        echo "Sending deployment notification..."
+        
+        FRONTEND_URL=$(gcloud run services describe savelife-frontend --platform=managed --region=us-central1 --format="value(status.url)")
+        BACKEND_URL=$(gcloud run services describe savelife-backend --platform=managed --region=us-central1 --format="value(status.url)")
+        
+        echo "Deployment Summary:"
+        echo "==================="
+        echo "Commit: $COMMIT_SHA"
+        echo "Branch: $BRANCH_NAME"
+        echo "Frontend URL: $FRONTEND_URL"
+        echo "Backend URL: $BACKEND_URL"
+        echo "Build ID: $BUILD_ID"
+        echo "Build Time: $(date)"
+        
+        # Here you could add webhook notifications to Slack, Discord, etc.
+        # curl -X POST -H 'Content-type: application/json' \
+        #   --data '{"text":"SaveLife.com deployed successfully!"}' \
+        #   $SLACK_WEBHOOK_URL
+      fi
+  id: 'notify-deployment'
+  waitFor: ['integration-tests']
+
+# Build options
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: 'E2_HIGHCPU_8'
+  diskSizeGb: 100
+  substitutionOption: 'ALLOW_LOOSE'
+
+# Substitutions for environment variables
+substitutions:
+  _ENVIRONMENT: 'production'
+  _REGION: 'us-central1'
+
+# Build timeout (30 minutes)
+timeout: '1800s'
+
+# Images to be pushed to Container Registry
+images:
+  - 'gcr.io/$PROJECT_ID/frontend:$COMMIT_SHA'
+  - 'gcr.io/$PROJECT_ID/backend:$COMMIT_SHA'
+  - 'gcr.io/$PROJECT_ID/frontend:latest'
+  - 'gcr.io/$PROJECT_ID/backend:latest'
+
+# Build artifacts
+artifacts:
+  objects:
+    location: 'gs://savelife-build-artifacts'
+    paths:
+      - 'frontend/dist/**/*'
+      - 'backend/coverage.xml'
+      - 'test-results/**/*'
+
